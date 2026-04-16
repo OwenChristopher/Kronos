@@ -20,6 +20,7 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
+test_inference.py
 
 # Jupyter Notebook
 .ipynb_checkpoints

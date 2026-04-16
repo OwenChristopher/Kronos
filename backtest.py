@@ -1,0 +1,370 @@
+import json
+import math
+from datetime import UTC, datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+
+from config import Config
+from inference import (
+    aggregate_paths,
+    interval_to_timedelta,
+    isoformat_timestamp,
+    load_predictor,
+    prepare_model_frame,
+    update_kline_cache,
+)
+
+
+def get_backtest_config() -> dict:
+    config = dict(Config.backtest)
+    required_keys = {
+        "symbol",
+        "interval",
+        "lookback",
+        "evaluation_days",
+        "pred_len",
+        "use_monte_carlo_average",
+        "monte_carlo_paths",
+        "temperature",
+        "top_k",
+        "top_p",
+        "use_volume",
+        "apply_fees",
+        "entry_fee_rate",
+        "exit_fee_rate",
+        "entry_threshold",
+        "exit_threshold",
+        "confidence_threshold",
+        "min_hold_bars",
+    }
+    missing = sorted(required_keys.difference(config))
+    if missing:
+        raise KeyError(f"Missing backtest config keys in config.py: {missing}")
+    if config["pred_len"] != 1:
+        raise ValueError("backtest.py currently supports pred_len = 1 only.")
+    if config["monte_carlo_paths"] < 1:
+        raise ValueError("monte_carlo_paths must be at least 1.")
+    if float(config["evaluation_days"]) <= 0:
+        raise ValueError("evaluation_days must be greater than 0.")
+    if config["entry_fee_rate"] < 0 or config["exit_fee_rate"] < 0:
+        raise ValueError("entry_fee_rate and exit_fee_rate must be non-negative.")
+    return config
+
+
+def ensure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def compute_evaluation_bars(interval: str, evaluation_days: int | float) -> int:
+    interval_delta = interval_to_timedelta(interval)
+    evaluation_span = pd.Timedelta(days=float(evaluation_days))
+    return max(1, math.ceil(evaluation_span / interval_delta))
+
+
+def compute_backtest_metrics(results_df: pd.DataFrame) -> dict:
+    predicted_returns = results_df["predicted_return"].to_numpy(dtype=np.float64)
+    actual_returns = results_df["actual_return"].to_numpy(dtype=np.float64)
+    gross_strategy_returns = results_df["gross_strategy_return"].to_numpy(dtype=np.float64)
+    net_strategy_returns = results_df["net_strategy_return"].to_numpy(dtype=np.float64)
+
+    mae = float(np.mean(np.abs(predicted_returns - actual_returns)))
+    rmse = float(np.sqrt(np.mean((predicted_returns - actual_returns) ** 2)))
+    direction_accuracy = float(np.mean(np.sign(predicted_returns) == np.sign(actual_returns)))
+
+    correlation = None
+    if len(results_df) > 1 and np.std(predicted_returns) > 0 and np.std(actual_returns) > 0:
+        correlation = float(np.corrcoef(predicted_returns, actual_returns)[0, 1])
+
+    cumulative_strategy_return_gross = float(np.prod(1.0 + gross_strategy_returns) - 1.0)
+    cumulative_strategy_return_net = float(np.prod(1.0 + net_strategy_returns) - 1.0)
+    cumulative_buy_hold_return_gross = float(np.prod(1.0 + actual_returns) - 1.0)
+    buy_hold_fee_multiplier = 1.0
+    if len(results_df) > 0:
+        buy_hold_entry_fee_rate = float(results_df["entry_fee_rate"].max())
+        buy_hold_exit_fee_rate = float(results_df["exit_fee_rate"].max())
+        buy_hold_fee_multiplier = (1.0 - buy_hold_entry_fee_rate) * (1.0 - buy_hold_exit_fee_rate)
+    cumulative_buy_hold_return_net = float(
+        (1.0 + cumulative_buy_hold_return_gross) * buy_hold_fee_multiplier - 1.0
+    )
+
+    entries = int(results_df["entry_event"].sum())
+    exits = int(results_df["exit_event"].sum())
+    bars_in_position = int((results_df["position"] != 0).sum())
+
+    return {
+        "num_periods": int(len(results_df)),
+        "return_mae": mae,
+        "return_rmse": rmse,
+        "direction_accuracy": direction_accuracy,
+        "return_correlation": correlation,
+        "cumulative_strategy_return_gross": cumulative_strategy_return_gross,
+        "cumulative_strategy_return_net": cumulative_strategy_return_net,
+        "cumulative_buy_hold_return_gross": cumulative_buy_hold_return_gross,
+        "cumulative_buy_hold_return_net": cumulative_buy_hold_return_net,
+        "average_period_strategy_return_gross": float(np.mean(gross_strategy_returns)),
+        "average_period_strategy_return_net": float(np.mean(net_strategy_returns)),
+        "average_next_up_probability": float(results_df["next_up_probability"].mean()),
+        "average_close_mae": float(results_df["close_abs_error"].mean()),
+        "entry_count": entries,
+        "exit_count": exits,
+        "round_trips": min(entries, exits),
+        "bars_in_position": bars_in_position,
+        "bars_flat": int(len(results_df)) - bars_in_position,
+        "total_fees_paid": float(results_df["fee_paid"].sum()),
+    }
+
+
+def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
+    backtest_config = get_backtest_config()
+    model_config = dict(Config.backtest_model)
+    predictor = load_predictor(Config, model_config)
+    symbol = backtest_config["symbol"]
+    interval = backtest_config["interval"]
+    effective_sample_count = (
+        backtest_config["monte_carlo_paths"]
+        if backtest_config["use_monte_carlo_average"]
+        else 1
+    )
+    evaluation_bars = compute_evaluation_bars(
+        interval,
+        backtest_config["evaluation_days"],
+    )
+    forecast_mode = (
+        f"monte_carlo_average_{backtest_config['monte_carlo_paths']}"
+        if backtest_config["use_monte_carlo_average"]
+        else "single_path"
+    )
+
+    entry_threshold = float(backtest_config["entry_threshold"])
+    exit_threshold = float(backtest_config["exit_threshold"])
+    confidence_threshold = float(backtest_config["confidence_threshold"])
+    min_hold_bars = int(backtest_config["min_hold_bars"])
+    entry_fee_rate = float(backtest_config["entry_fee_rate"])
+    exit_fee_rate = float(backtest_config["exit_fee_rate"])
+    apply_fees = backtest_config["apply_fees"]
+
+    kline_df, cache_path = update_kline_cache(
+        Config.cache_root,
+        symbol,
+        interval,
+        Config.binance_limit,
+        min_rows=backtest_config["lookback"] + evaluation_bars,
+    )
+    minimum_rows = backtest_config["lookback"] + evaluation_bars
+    if len(kline_df) < minimum_rows:
+        raise RuntimeError(
+            f"Need at least {minimum_rows} closed {interval} candles to cover "
+            f"{backtest_config['evaluation_days']} day(s), got {len(kline_df)}."
+        )
+
+    evaluation_start = len(kline_df) - evaluation_bars
+    rows = []
+
+    position = 0.0
+    bars_held = 0
+    entry_price = 0.0
+
+    for target_idx in range(evaluation_start, len(kline_df)):
+        context_start = target_idx - backtest_config["lookback"]
+        context_df = kline_df.iloc[context_start:target_idx].copy().reset_index(drop=True)
+        actual_row = kline_df.iloc[target_idx]
+        x_timestamp = context_df["timestamps"].reset_index(drop=True)
+        y_timestamp = pd.Series(
+            [pd.Timestamp(actual_row["timestamps"]).tz_convert(UTC)],
+            name="timestamps",
+        )
+        model_df = prepare_model_frame(context_df, backtest_config["use_volume"])
+
+        with torch.no_grad():
+            path_frames = predictor.predict_paths(
+                df=model_df,
+                x_timestamp=x_timestamp,
+                y_timestamp=y_timestamp,
+                pred_len=1,
+                T=backtest_config["temperature"],
+                top_k=backtest_config["top_k"],
+                top_p=backtest_config["top_p"],
+                sample_count=effective_sample_count,
+                verbose=False,
+            )
+
+        aggregated = aggregate_paths(path_frames)
+        forecast_candle = aggregated["mean_candles"][0]
+        previous_close = float(context_df["close"].iloc[-1])
+        actual_close = float(actual_row["close"])
+        predicted_close = float(forecast_candle["close"])
+        predicted_return = float((predicted_close / previous_close) - 1.0)
+        actual_return = float((actual_close / previous_close) - 1.0)
+
+        close_paths = np.asarray(aggregated["close_paths"], dtype=np.float64)[:, 0]
+        up_probability = float(np.mean(close_paths > previous_close))
+        directional_confidence = max(up_probability, 1.0 - up_probability)
+
+        desired_direction = float(np.sign(predicted_return))
+        strong_signal = abs(predicted_return) >= entry_threshold
+        confident = directional_confidence >= confidence_threshold
+        weak_signal = abs(predicted_return) < exit_threshold
+
+        prev_position = position
+        entry_event = False
+        exit_event = False
+        fee_paid = 0.0
+
+        if position == 0.0:
+            if strong_signal and confident:
+                position = desired_direction
+                bars_held = 0
+                entry_price = previous_close
+                entry_event = True
+                if apply_fees:
+                    fee_paid += entry_fee_rate
+        else:
+            bars_held += 1
+            can_exit = bars_held >= min_hold_bars
+
+            if can_exit:
+                signal_flipped = desired_direction != 0.0 and desired_direction != position
+                conviction_gone = weak_signal or not confident
+
+                if signal_flipped and strong_signal and confident:
+                    exit_event = True
+                    entry_event = True
+                    position = desired_direction
+                    bars_held = 0
+                    entry_price = previous_close
+                    if apply_fees:
+                        fee_paid += exit_fee_rate + entry_fee_rate
+                elif signal_flipped or conviction_gone:
+                    exit_event = True
+                    position = 0.0
+                    bars_held = 0
+                    entry_price = 0.0
+                    if apply_fees:
+                        fee_paid += exit_fee_rate
+
+        gross_strategy_return = float(prev_position * actual_return)
+        net_strategy_return = gross_strategy_return - fee_paid
+
+        rows.append(
+            {
+                "target_timestamp": isoformat_timestamp(actual_row["timestamps"]),
+                "previous_close": previous_close,
+                "predicted_close": predicted_close,
+                "actual_close": actual_close,
+                "predicted_return": predicted_return,
+                "actual_return": actual_return,
+                "position": prev_position,
+                "new_position": position,
+                "entry_event": entry_event,
+                "exit_event": exit_event,
+                "bars_held": bars_held,
+                "directional_confidence": directional_confidence,
+                "entry_fee_rate": entry_fee_rate if entry_event else 0.0,
+                "exit_fee_rate": exit_fee_rate if exit_event else 0.0,
+                "round_trip_fee_rate": 0.0,
+                "fee_paid": fee_paid,
+                "gross_strategy_return": gross_strategy_return,
+                "net_strategy_return": net_strategy_return,
+                "next_up_probability": up_probability,
+                "forecast_mode": forecast_mode,
+                "effective_sample_count": effective_sample_count,
+                "close_abs_error": float(abs(predicted_close - actual_close)),
+                "predicted_volume": float(forecast_candle["volume"]),
+                "actual_volume": float(actual_row["volume"]),
+                "volume_abs_error": float(abs(float(forecast_candle["volume"]) - float(actual_row["volume"]))),
+            }
+        )
+
+    results_df = pd.DataFrame(rows)
+    metrics = compute_backtest_metrics(results_df)
+
+    generated_at = datetime.now(UTC)
+    run_id = (
+        f"{symbol.lower()}_{interval}_backtest_{generated_at.strftime('%Y%m%dT%H%M%SZ')}"
+    )
+    artifact_dir = ensure_dir(Config.cache_root / "backtests" / symbol.upper() / interval)
+    csv_path = artifact_dir / f"{run_id}.csv"
+    json_path = artifact_dir / f"{run_id}.json"
+
+    results_df.to_csv(csv_path, index=False)
+    summary = {
+        "run_id": run_id,
+        "generated_at": generated_at.isoformat(),
+        "symbol": symbol,
+        "interval": interval,
+        "model": model_config,
+        "kline_cache_path": str(cache_path),
+        "params": {
+            **backtest_config,
+            "evaluation_bars": evaluation_bars,
+            "effective_sample_count": effective_sample_count,
+            "forecast_mode": forecast_mode,
+        },
+        "metrics": metrics,
+        "rows": results_df.to_dict(orient="records"),
+        "artifacts": {
+            "csv": str(csv_path),
+            "json": str(json_path),
+        },
+    }
+    with json_path.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+
+    return summary, results_df, json_path
+
+
+def print_summary(summary: dict) -> None:
+    m = summary["metrics"]
+    p = summary["params"]
+    print(f"\nBacktest saved: {summary['artifacts']['json']}")
+    print(f"{'='*80}")
+    print(
+        f"{summary['symbol']} {summary['interval']} | "
+        f"days: {p['evaluation_days']} | bars: {p['evaluation_bars']} | "
+        f"mode: {p['forecast_mode']}"
+    )
+    print(f"{'─'*80}")
+    print(f"  Prediction quality:")
+    print(f"    return MAE: {m['return_mae']:.6f} | RMSE: {m['return_rmse']:.6f}")
+    print(
+        f"    direction accuracy: {m['direction_accuracy']:.1%} | "
+        f"correlation: {m['return_correlation'] if m['return_correlation'] is not None else 'n/a'}"
+    )
+    print(f"{'─'*80}")
+    print(f"  Strategy performance:")
+    print(f"    gross: {m['cumulative_strategy_return_gross']:+.2%} | net: {m['cumulative_strategy_return_net']:+.2%}")
+    print(
+        f"    buy & hold gross: {m['cumulative_buy_hold_return_gross']:+.2%} | "
+        f"net: {m['cumulative_buy_hold_return_net']:+.2%}"
+    )
+    print(f"{'─'*80}")
+    print(f"  Trading activity:")
+    print(
+        f"    entries: {m['entry_count']} | exits: {m['exit_count']} | "
+        f"round trips: {m['round_trips']}"
+    )
+    print(
+        f"    bars in position: {m['bars_in_position']}/{m['num_periods']} | "
+        f"bars flat: {m['bars_flat']}/{m['num_periods']}"
+    )
+    print(f"    total fees paid: {m['total_fees_paid']:.6f}")
+    print(f"{'='*80}\n")
+
+
+def main() -> int:
+    try:
+        summary, _, _ = run_backtest()
+    except Exception as exc:
+        print(f"Backtest failed: {exc}")
+        return 1
+
+    print_summary(summary)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
