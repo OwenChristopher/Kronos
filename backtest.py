@@ -7,10 +7,10 @@ import numpy as np
 import pandas as pd
 import torch
 from scipy import stats as sp_stats
+from tqdm import tqdm
 
 from config import Config
 from inference import (
-    aggregate_paths,
     compute_future_timestamps,
     interval_to_timedelta,
     isoformat_timestamp,
@@ -91,10 +91,13 @@ def compute_signal(
     trajectory_return_per_path = (trajectory_mean_per_path / previous_close) - 1.0
     trajectory_return = float(np.mean(trajectory_return_per_path))
 
-    # Next-bar close paths (for confidence)
+    # Trajectory-level MC agreement: what fraction of paths have positive avg return
+    trajectory_up_probability = float(np.mean(trajectory_return_per_path > 0))
+    trajectory_confidence = max(trajectory_up_probability, 1.0 - trajectory_up_probability)
+
+    # Next-bar level (for secondary reporting)
     next_close_paths = close_paths[:, 0]
-    up_probability = float(np.mean(next_close_paths > previous_close))
-    directional_confidence = max(up_probability, 1.0 - up_probability)
+    next_bar_up_probability = float(np.mean(next_close_paths > previous_close))
 
     # --- (F) Volatility-adjusted signal (predicted Sharpe) ---
     # Use mean predicted high-low range as volatility proxy
@@ -120,8 +123,8 @@ def compute_signal(
     # Magnitude signal: scale predicted return
     magnitude_signal = np.clip(trajectory_return / signal_scale, -1.0, 1.0)
 
-    # Probability signal: how one-sided is the MC distribution
-    probability_signal = (up_probability - 0.5) * 2.0  # [-1, 1]
+    # Probability signal from trajectory-level agreement (signed, can veto direction)
+    probability_signal = (trajectory_up_probability - 0.5) * 2.0  # [-1, 1]
 
     # Skew bonus: if distribution is skewed in the direction of the trade, boost
     direction = np.sign(trajectory_return)
@@ -131,14 +134,15 @@ def compute_signal(
     # Volatility gate: penalize when predicted Sharpe is too low
     vol_gate = 1.0 if predicted_sharpe >= min_predicted_sharpe else predicted_sharpe / min_predicted_sharpe
 
-    # Composite signal
-    raw_signal = magnitude_signal * abs(probability_signal) * vol_gate + skew_bonus
+    # Composite: probability_signal is signed so it can oppose magnitude_signal
+    raw_signal = magnitude_signal * probability_signal * vol_gate + skew_bonus
     composite_signal = float(np.clip(raw_signal, -1.0, 1.0))
 
     return {
         "trajectory_return": trajectory_return,
-        "up_probability": up_probability,
-        "directional_confidence": directional_confidence,
+        "trajectory_up_probability": trajectory_up_probability,
+        "trajectory_confidence": trajectory_confidence,
+        "next_bar_up_probability": next_bar_up_probability,
         "predicted_vol": predicted_vol,
         "predicted_sharpe": predicted_sharpe,
         "skewness": skewness,
@@ -160,17 +164,24 @@ def compute_signal(
 
 def compute_backtest_metrics(results_df: pd.DataFrame) -> dict:
     actual_returns = results_df["actual_return"].to_numpy(dtype=np.float64)
+    actual_trajectory_returns = results_df["actual_trajectory_return"].to_numpy(dtype=np.float64)
     gross_strategy_returns = results_df["gross_strategy_return"].to_numpy(dtype=np.float64)
     net_strategy_returns = results_df["net_strategy_return"].to_numpy(dtype=np.float64)
 
     trajectory_returns = results_df["trajectory_return"].to_numpy(dtype=np.float64)
-    direction_accuracy = float(
+
+    # Next-bar: does the trajectory signal predict the next single bar's direction?
+    next_bar_direction_accuracy = float(
         np.mean(np.sign(trajectory_returns) == np.sign(actual_returns))
+    )
+    # Trajectory: does the trajectory signal match the actual multi-bar trajectory?
+    trajectory_direction_accuracy = float(
+        np.mean(np.sign(trajectory_returns) == np.sign(actual_trajectory_returns))
     )
 
     correlation = None
-    if len(results_df) > 1 and np.std(trajectory_returns) > 0 and np.std(actual_returns) > 0:
-        correlation = float(np.corrcoef(trajectory_returns, actual_returns)[0, 1])
+    if len(results_df) > 1 and np.std(trajectory_returns) > 0 and np.std(actual_trajectory_returns) > 0:
+        correlation = float(np.corrcoef(trajectory_returns, actual_trajectory_returns)[0, 1])
 
     cumulative_strategy_return_gross = float(np.prod(1.0 + gross_strategy_returns) - 1.0)
     cumulative_strategy_return_net = float(np.prod(1.0 + net_strategy_returns) - 1.0)
@@ -207,7 +218,8 @@ def compute_backtest_metrics(results_df: pd.DataFrame) -> dict:
 
     return {
         "num_periods": int(len(results_df)),
-        "direction_accuracy": direction_accuracy,
+        "next_bar_direction_accuracy": next_bar_direction_accuracy,
+        "trajectory_direction_accuracy": trajectory_direction_accuracy,
         "return_correlation": correlation,
         "cumulative_strategy_return_gross": cumulative_strategy_return_gross,
         "cumulative_strategy_return_net": cumulative_strategy_return_net,
@@ -280,6 +292,7 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
         Config.cache_root, symbol, ensemble_interval, Config.binance_limit,
         min_rows=ensemble_lookback + evaluation_bars * 4,
     )
+    ensemble_kline_df["_ts_utc"] = pd.to_datetime(ensemble_kline_df["timestamps"], utc=True)
     print(
         f"Loaded {len(kline_df)} {interval} bars + {len(ensemble_kline_df)} {ensemble_interval} bars for ensemble"
     )
@@ -290,13 +303,18 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
     position = 0.0
     bars_held = 0
 
-    for target_idx in range(evaluation_start, len(kline_df)):
+    for target_idx in tqdm(range(evaluation_start, len(kline_df)), desc="Backtesting", unit="bar"):
         context_start = target_idx - backtest_config["lookback"]
         context_df = kline_df.iloc[context_start:target_idx].copy().reset_index(drop=True)
         actual_row = kline_df.iloc[target_idx]
         previous_close = float(context_df["close"].iloc[-1])
         actual_close = float(actual_row["close"])
         actual_return = float((actual_close / previous_close) - 1.0)
+
+        # Actual trajectory return: average of next pred_len bars' closes vs previous_close
+        trajectory_end = min(target_idx + pred_len, len(kline_df))
+        future_closes = kline_df["close"].iloc[target_idx:trajectory_end].to_numpy(dtype=np.float64)
+        actual_trajectory_return = float((np.mean(future_closes) / previous_close) - 1.0)
 
         x_timestamp = context_df["timestamps"].reset_index(drop=True)
 
@@ -331,21 +349,15 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
 
         # --- (L) Ensemble: secondary timeframe prediction ---
         ensemble_signal = 0.0
-        primary_bar_ts = pd.Timestamp(last_ts)
-        if primary_bar_ts.tzinfo is None:
-            primary_bar_ts = primary_bar_ts.tz_localize(UTC)
-        else:
-            primary_bar_ts = primary_bar_ts.tz_convert(UTC)
+        primary_bar_ts = pd.Timestamp(last_ts, tz=UTC) if pd.Timestamp(last_ts).tzinfo is None else pd.Timestamp(last_ts).tz_convert(UTC)
 
-        ens_mask = ensemble_kline_df["timestamps"].apply(
-            lambda t: (pd.Timestamp(t).tz_convert(UTC) if pd.Timestamp(t).tzinfo else pd.Timestamp(t).tz_localize(UTC)) <= primary_bar_ts
-        )
-        ens_available = ensemble_kline_df[ens_mask]
+        ens_available = ensemble_kline_df[ensemble_kline_df["_ts_utc"] <= primary_bar_ts]
 
         if len(ens_available) >= ensemble_lookback:
             ens_context = ens_available.tail(ensemble_lookback).copy().reset_index(drop=True)
             ens_x_ts = ens_context["timestamps"].reset_index(drop=True)
             ens_last_ts = ens_context["timestamps"].iloc[-1]
+            ens_previous_close = float(ens_context["close"].iloc[-1])
             ens_y_ts = compute_future_timestamps(ens_last_ts, ensemble_interval, ensemble_pred_len)
             ens_model_df = prepare_model_frame(ens_context, backtest_config["use_volume"])
 
@@ -366,7 +378,7 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
                 [f[FEATURE_NAMES].to_numpy(dtype=np.float64) for f in ens_path_frames]
             )
             ens_sig = compute_signal(
-                ens_arrays, previous_close, ensemble_pred_len,
+                ens_arrays, ens_previous_close, ensemble_pred_len,
                 signal_scale, min_predicted_sharpe, skew_weight, confidence_threshold,
             )
             ensemble_signal = ens_sig["composite_signal"]
@@ -386,7 +398,7 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
         fee_paid = 0.0
 
         desired_position = blended_signal
-        confident = sig["directional_confidence"] >= confidence_threshold
+        confident = sig["trajectory_confidence"] >= confidence_threshold
 
         if position == 0.0:
             if confident and abs(desired_position) > 0.1:
@@ -422,7 +434,7 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
                     position = desired_position
 
         gross_strategy_return = float(prev_position * actual_return)
-        net_strategy_return = gross_strategy_return - fee_paid
+        net_strategy_return = float((1.0 + gross_strategy_return) * (1.0 - fee_paid) - 1.0)
 
         # First-step predicted close (for logging)
         mean_first_close = float(np.mean(path_arrays[:, 0, FEATURE_NAMES.index("close")]))
@@ -433,9 +445,11 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
             "predicted_close_step1": mean_first_close,
             "actual_close": actual_close,
             "actual_return": actual_return,
+            "actual_trajectory_return": actual_trajectory_return,
             "trajectory_return": sig["trajectory_return"],
-            "up_probability": sig["up_probability"],
-            "directional_confidence": sig["directional_confidence"],
+            "trajectory_up_probability": sig["trajectory_up_probability"],
+            "trajectory_confidence": sig["trajectory_confidence"],
+            "next_bar_up_probability": sig["next_bar_up_probability"],
             "predicted_vol": sig["predicted_vol"],
             "predicted_sharpe": sig["predicted_sharpe"],
             "skewness": sig["skewness"],
@@ -513,8 +527,11 @@ def print_summary(summary: dict) -> None:
     print(f"{'─'*80}")
     print(f"  Prediction quality:")
     print(
-        f"    direction accuracy: {m['direction_accuracy']:.1%} | "
-        f"correlation: {m['return_correlation'] if m['return_correlation'] is not None else 'n/a'}"
+        f"    next-bar dir accuracy: {m['next_bar_direction_accuracy']:.1%} | "
+        f"trajectory dir accuracy: {m['trajectory_direction_accuracy']:.1%}"
+    )
+    print(
+        f"    trajectory correlation: {m['return_correlation'] if m['return_correlation'] is not None else 'n/a'}"
     )
     print(f"{'─'*80}")
     print(f"  Strategy performance:")
