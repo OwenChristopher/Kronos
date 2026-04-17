@@ -6,7 +6,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from scipy import stats as sp_stats
 from tqdm import tqdm
 
 from config import Config
@@ -21,18 +20,17 @@ from inference import (
 
 
 FEATURE_NAMES = ["open", "high", "low", "close", "volume", "amount"]
+CLOSE_INDEX = FEATURE_NAMES.index("close")
 
 
 def get_backtest_config() -> dict:
     config = dict(Config.backtest)
     required_keys = {
-        "symbol", "interval", "lookback", "evaluation_days", "pred_len",
-        "use_monte_carlo_average", "monte_carlo_paths", "temperature",
-        "top_k", "top_p", "use_volume", "apply_fees",
-        "entry_fee_rate", "exit_fee_rate",
-        "confidence_threshold", "min_hold_bars",
-        "signal_scale", "min_predicted_sharpe", "skew_weight",
-        "ensemble_interval", "ensemble_lookback", "ensemble_pred_len", "ensemble_weight",
+        "symbol", "interval", "lookback", "evaluation_days",
+        "use_monte_carlo_average", "monte_carlo_paths",
+        "temperature", "top_k", "top_p", "use_volume",
+        "apply_fees", "entry_fee_rate", "exit_fee_rate",
+        "entry_threshold_multiplier", "exit_threshold_multiplier",
     }
     missing = sorted(required_keys.difference(config))
     if missing:
@@ -55,150 +53,81 @@ def compute_evaluation_bars(interval: str, evaluation_days: int | float) -> int:
     return max(1, math.ceil(evaluation_span / interval_delta))
 
 
+def round_trip_fee(entry_fee: float, exit_fee: float) -> float:
+    return 1.0 - (1.0 - entry_fee) * (1.0 - exit_fee)
+
+
 # ---------------------------------------------------------------------------
-# Signal computation from MC paths
+# Position state machine
 # ---------------------------------------------------------------------------
+#
+# Fee-aware threshold with hysteresis:
+#   - Enter only when |predicted_return| exceeds entry_threshold
+#   - Stay in position while opposite signal is weaker than exit_threshold
+#   - Flip in a single step when opposite signal clears entry_threshold
+#
+# entry_threshold > exit_threshold. Gap creates the no-trade band that kills
+# the flip-flop fee drag.
 
-def compute_signal(
-    path_arrays: np.ndarray,
-    previous_close: float,
-    pred_len: int,
-    signal_scale: float,
-    min_predicted_sharpe: float,
-    skew_weight: float,
-    confidence_threshold: float,
-) -> dict:
-    """
-    Compute a composite trading signal from Monte Carlo path predictions.
+def decide_next_position(
+    current_position: float,
+    predicted_return: float,
+    entry_threshold: float,
+    exit_threshold: float,
+) -> tuple[float, bool, bool]:
+    """Return (new_position, entry_event, exit_event)."""
+    if current_position == 0.0:
+        if predicted_return > entry_threshold:
+            return 1.0, True, False
+        if predicted_return < -entry_threshold:
+            return -1.0, True, False
+        return 0.0, False, False
 
-    path_arrays: shape (num_paths, pred_len, 6) — OHLCVA per path per step
-    Returns dict with signal components and final composite signal in [-1, 1].
-    """
-    num_paths = path_arrays.shape[0]
+    if current_position > 0.0:
+        if predicted_return < -entry_threshold:
+            return -1.0, True, True  # flip
+        if predicted_return < -exit_threshold:
+            return 0.0, False, True  # exit to flat
+        return current_position, False, False
 
-    # --- (E) Multi-step trajectory signal ---
-    # Average predicted close across the full horizon, per path
-    close_idx = FEATURE_NAMES.index("close")
-    high_idx = FEATURE_NAMES.index("high")
-    low_idx = FEATURE_NAMES.index("low")
-
-    close_paths = path_arrays[:, :, close_idx]            # (num_paths, pred_len)
-    high_paths = path_arrays[:, :, high_idx]
-    low_paths = path_arrays[:, :, low_idx]
-
-    # Eq. 13 from paper: average predicted close over horizon
-    trajectory_mean_per_path = np.mean(close_paths, axis=1)   # (num_paths,)
-    trajectory_return_per_path = (trajectory_mean_per_path / previous_close) - 1.0
-    trajectory_return = float(np.mean(trajectory_return_per_path))
-
-    # Trajectory-level MC agreement: what fraction of paths have positive avg return
-    trajectory_up_probability = float(np.mean(trajectory_return_per_path > 0))
-    trajectory_confidence = max(trajectory_up_probability, 1.0 - trajectory_up_probability)
-
-    # Next-bar level (for secondary reporting)
-    next_close_paths = close_paths[:, 0]
-    next_bar_up_probability = float(np.mean(next_close_paths > previous_close))
-
-    # --- (F) Volatility-adjusted signal (predicted Sharpe) ---
-    # Use mean predicted high-low range as volatility proxy
-    range_per_step = high_paths - low_paths                   # (num_paths, pred_len)
-    mean_range = float(np.mean(range_per_step))
-    predicted_vol = mean_range / previous_close
-    predicted_vol = max(predicted_vol, 1e-8)
-    predicted_sharpe = abs(trajectory_return) / predicted_vol
-
-    # --- (G) MC distribution shape ---
-    path_returns = trajectory_return_per_path
-    skewness = float(sp_stats.skew(path_returns)) if num_paths > 2 else 0.0
-    kurtosis = float(sp_stats.kurtosis(path_returns, fisher=True)) if num_paths > 2 else 0.0
-    return_std = float(np.std(path_returns))
-
-    # Tail risk: expected shortfall below p10 and above p90
-    p10 = np.percentile(path_returns, 10)
-    p90 = np.percentile(path_returns, 90)
-    downside_tail = float(np.mean(path_returns[path_returns <= p10])) if np.any(path_returns <= p10) else 0.0
-    upside_tail = float(np.mean(path_returns[path_returns >= p90])) if np.any(path_returns >= p90) else 0.0
-
-    # --- (K) Continuous position sizing ---
-    # Magnitude signal: scale predicted return
-    magnitude_signal = np.clip(trajectory_return / signal_scale, -1.0, 1.0)
-
-    # Probability signal from trajectory-level agreement (signed, can veto direction)
-    probability_signal = (trajectory_up_probability - 0.5) * 2.0  # [-1, 1]
-
-    # Skew bonus: if distribution is skewed in the direction of the trade, boost
-    direction = np.sign(trajectory_return)
-    skew_alignment = direction * skewness
-    skew_bonus = np.clip(skew_alignment * skew_weight, -0.3, 0.3)
-
-    # Volatility gate: penalize when predicted Sharpe is too low
-    vol_gate = 1.0 if predicted_sharpe >= min_predicted_sharpe else predicted_sharpe / min_predicted_sharpe
-
-    # Composite: probability_signal is signed so it can oppose magnitude_signal
-    raw_signal = magnitude_signal * probability_signal * vol_gate + skew_bonus
-    composite_signal = float(np.clip(raw_signal, -1.0, 1.0))
-
-    return {
-        "trajectory_return": trajectory_return,
-        "trajectory_up_probability": trajectory_up_probability,
-        "trajectory_confidence": trajectory_confidence,
-        "next_bar_up_probability": next_bar_up_probability,
-        "predicted_vol": predicted_vol,
-        "predicted_sharpe": predicted_sharpe,
-        "skewness": skewness,
-        "kurtosis": kurtosis,
-        "return_std": return_std,
-        "downside_tail": downside_tail,
-        "upside_tail": upside_tail,
-        "magnitude_signal": float(magnitude_signal),
-        "probability_signal": float(probability_signal),
-        "skew_bonus": float(skew_bonus),
-        "vol_gate": float(vol_gate),
-        "composite_signal": composite_signal,
-    }
+    # current_position < 0
+    if predicted_return > entry_threshold:
+        return 1.0, True, True  # flip
+    if predicted_return > exit_threshold:
+        return 0.0, False, True  # exit to flat
+    return current_position, False, False
 
 
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
 
-def compute_backtest_metrics(results_df: pd.DataFrame) -> dict:
+def compute_backtest_metrics(results_df: pd.DataFrame, interval: str) -> dict:
+    predicted_returns = results_df["predicted_return"].to_numpy(dtype=np.float64)
     actual_returns = results_df["actual_return"].to_numpy(dtype=np.float64)
-    actual_trajectory_returns = results_df["actual_trajectory_return"].to_numpy(dtype=np.float64)
     gross_strategy_returns = results_df["gross_strategy_return"].to_numpy(dtype=np.float64)
     net_strategy_returns = results_df["net_strategy_return"].to_numpy(dtype=np.float64)
 
-    trajectory_returns = results_df["trajectory_return"].to_numpy(dtype=np.float64)
-
-    # Next-bar: does the trajectory signal predict the next single bar's direction?
-    next_bar_direction_accuracy = float(
-        np.mean(np.sign(trajectory_returns) == np.sign(actual_returns))
-    )
-    # Trajectory: does the trajectory signal match the actual multi-bar trajectory?
-    trajectory_direction_accuracy = float(
-        np.mean(np.sign(trajectory_returns) == np.sign(actual_trajectory_returns))
-    )
+    mae = float(np.mean(np.abs(predicted_returns - actual_returns)))
+    direction_accuracy = float(np.mean(np.sign(predicted_returns) == np.sign(actual_returns)))
 
     correlation = None
-    if len(results_df) > 1 and np.std(trajectory_returns) > 0 and np.std(actual_trajectory_returns) > 0:
-        correlation = float(np.corrcoef(trajectory_returns, actual_trajectory_returns)[0, 1])
+    if len(results_df) > 1 and np.std(predicted_returns) > 0 and np.std(actual_returns) > 0:
+        correlation = float(np.corrcoef(predicted_returns, actual_returns)[0, 1])
 
     cumulative_strategy_return_gross = float(np.prod(1.0 + gross_strategy_returns) - 1.0)
     cumulative_strategy_return_net = float(np.prod(1.0 + net_strategy_returns) - 1.0)
     cumulative_buy_hold_return_gross = float(np.prod(1.0 + actual_returns) - 1.0)
 
-    buy_hold_fee_multiplier = 1.0
-    if len(results_df) > 0:
-        entry_fee = float(Config.backtest["entry_fee_rate"])
-        exit_fee = float(Config.backtest["exit_fee_rate"])
-        buy_hold_fee_multiplier = (1.0 - entry_fee) * (1.0 - exit_fee)
+    entry_fee = float(Config.backtest["entry_fee_rate"])
+    exit_fee = float(Config.backtest["exit_fee_rate"])
+    buy_hold_fee_multiplier = (1.0 - entry_fee) * (1.0 - exit_fee)
     cumulative_buy_hold_return_net = float(
         (1.0 + cumulative_buy_hold_return_gross) * buy_hold_fee_multiplier - 1.0
     )
 
-    # Sharpe ratio (annualized)
     if np.std(net_strategy_returns) > 0:
-        interval_hours = interval_to_timedelta(Config.backtest["interval"]).total_seconds() / 3600
+        interval_hours = interval_to_timedelta(interval).total_seconds() / 3600
         bars_per_year = 365.25 * 24 / interval_hours
         sharpe = float(
             np.mean(net_strategy_returns) / np.std(net_strategy_returns) * np.sqrt(bars_per_year)
@@ -206,7 +135,6 @@ def compute_backtest_metrics(results_df: pd.DataFrame) -> dict:
     else:
         sharpe = 0.0
 
-    # Max drawdown
     cumulative = np.cumprod(1.0 + net_strategy_returns)
     running_max = np.maximum.accumulate(cumulative)
     drawdowns = (cumulative - running_max) / running_max
@@ -218,8 +146,8 @@ def compute_backtest_metrics(results_df: pd.DataFrame) -> dict:
 
     return {
         "num_periods": int(len(results_df)),
-        "next_bar_direction_accuracy": next_bar_direction_accuracy,
-        "trajectory_direction_accuracy": trajectory_direction_accuracy,
+        "direction_accuracy": direction_accuracy,
+        "return_mae": mae,
         "return_correlation": correlation,
         "cumulative_strategy_return_gross": cumulative_strategy_return_gross,
         "cumulative_strategy_return_net": cumulative_strategy_return_net,
@@ -233,7 +161,6 @@ def compute_backtest_metrics(results_df: pd.DataFrame) -> dict:
         "bars_in_position": bars_in_position,
         "bars_flat": int(len(results_df)) - bars_in_position,
         "total_fees_paid": float(results_df["fee_paid"].sum()),
-        "average_position_size": float(results_df["position"].abs().mean()),
     }
 
 
@@ -247,31 +174,29 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
     predictor = load_predictor(Config, model_config)
     symbol = backtest_config["symbol"]
     interval = backtest_config["interval"]
-    pred_len = int(backtest_config["pred_len"])
     effective_sample_count = (
         backtest_config["monte_carlo_paths"]
         if backtest_config["use_monte_carlo_average"]
         else 1
     )
-    evaluation_bars = compute_evaluation_bars(
-        interval, backtest_config["evaluation_days"],
-    )
+    evaluation_bars = compute_evaluation_bars(interval, backtest_config["evaluation_days"])
     forecast_mode = (
         f"monte_carlo_average_{backtest_config['monte_carlo_paths']}"
         if backtest_config["use_monte_carlo_average"]
         else "single_path"
     )
 
-    confidence_threshold = float(backtest_config["confidence_threshold"])
-    min_hold_bars = int(backtest_config["min_hold_bars"])
-    signal_scale = float(backtest_config["signal_scale"])
-    min_predicted_sharpe = float(backtest_config["min_predicted_sharpe"])
-    skew_weight = float(backtest_config["skew_weight"])
     entry_fee_rate = float(backtest_config["entry_fee_rate"])
     exit_fee_rate = float(backtest_config["exit_fee_rate"])
     apply_fees = backtest_config["apply_fees"]
+    rt_fee = round_trip_fee(entry_fee_rate, exit_fee_rate)
+    entry_threshold = float(backtest_config["entry_threshold_multiplier"]) * rt_fee
+    exit_threshold = float(backtest_config["exit_threshold_multiplier"]) * rt_fee
+    if exit_threshold >= entry_threshold:
+        raise ValueError(
+            "exit_threshold_multiplier must be < entry_threshold_multiplier for hysteresis."
+        )
 
-    # --- Primary timeframe data ---
     kline_df, cache_path = update_kline_cache(
         Config.cache_root, symbol, interval, Config.binance_limit,
         min_rows=backtest_config["lookback"] + evaluation_bars,
@@ -282,26 +207,16 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
             f"Need at least {minimum_rows} closed {interval} candles, got {len(kline_df)}."
         )
 
-    # --- (L) Secondary timeframe data for ensemble ---
-    ensemble_interval = backtest_config["ensemble_interval"]
-    ensemble_lookback = int(backtest_config["ensemble_lookback"])
-    ensemble_pred_len = int(backtest_config["ensemble_pred_len"])
-    ensemble_weight = float(backtest_config["ensemble_weight"])
-
-    ensemble_kline_df, _ = update_kline_cache(
-        Config.cache_root, symbol, ensemble_interval, Config.binance_limit,
-        min_rows=ensemble_lookback + evaluation_bars * 4,
-    )
-    ensemble_kline_df["_ts_utc"] = pd.to_datetime(ensemble_kline_df["timestamps"], utc=True)
     print(
-        f"Loaded {len(kline_df)} {interval} bars + {len(ensemble_kline_df)} {ensemble_interval} bars for ensemble"
+        f"Loaded {len(kline_df)} {interval} bars | "
+        f"entry threshold: {entry_threshold*100:.3f}% | exit threshold: {exit_threshold*100:.3f}% | "
+        f"round-trip fee: {rt_fee*100:.3f}%"
     )
 
     evaluation_start = len(kline_df) - evaluation_bars
     rows = []
 
     position = 0.0
-    bars_held = 0
 
     for target_idx in tqdm(range(evaluation_start, len(kline_df)), desc="Backtesting", unit="bar"):
         context_start = target_idx - backtest_config["lookback"]
@@ -311,26 +226,18 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
         actual_close = float(actual_row["close"])
         actual_return = float((actual_close / previous_close) - 1.0)
 
-        # Actual trajectory return: average of next pred_len bars' closes vs previous_close
-        trajectory_end = min(target_idx + pred_len, len(kline_df))
-        future_closes = kline_df["close"].iloc[target_idx:trajectory_end].to_numpy(dtype=np.float64)
-        actual_trajectory_return = float((np.mean(future_closes) / previous_close) - 1.0)
-
         x_timestamp = context_df["timestamps"].reset_index(drop=True)
-
-        # Build future timestamps for multi-step prediction
         last_ts = context_df["timestamps"].iloc[-1]
-        y_timestamp = compute_future_timestamps(last_ts, interval, pred_len)
+        y_timestamp = compute_future_timestamps(last_ts, interval, 1)
 
         model_df = prepare_model_frame(context_df, backtest_config["use_volume"])
 
-        # --- Primary timeframe prediction ---
         with torch.no_grad():
             path_frames = predictor.predict_paths(
                 df=model_df,
                 x_timestamp=x_timestamp,
                 y_timestamp=y_timestamp,
-                pred_len=pred_len,
+                pred_len=1,
                 T=backtest_config["temperature"],
                 top_k=backtest_config["top_k"],
                 top_p=backtest_config["top_p"],
@@ -338,149 +245,52 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
                 verbose=False,
             )
 
-        path_arrays = np.stack(
-            [frame[FEATURE_NAMES].to_numpy(dtype=np.float64) for frame in path_frames]
+        path_closes = np.array(
+            [float(frame[FEATURE_NAMES].to_numpy(dtype=np.float64)[0, CLOSE_INDEX])
+             for frame in path_frames]
         )
+        predicted_close_mean = float(np.mean(path_closes))
+        predicted_return = float((predicted_close_mean / previous_close) - 1.0)
+        next_bar_up_probability = float(np.mean(path_closes > previous_close))
 
-        sig = compute_signal(
-            path_arrays, previous_close, pred_len,
-            signal_scale, min_predicted_sharpe, skew_weight, confidence_threshold,
-        )
-
-        # --- (L) Ensemble: secondary timeframe prediction ---
-        ensemble_signal = 0.0
-        primary_bar_ts = pd.Timestamp(last_ts, tz=UTC) if pd.Timestamp(last_ts).tzinfo is None else pd.Timestamp(last_ts).tz_convert(UTC)
-
-        ens_available = ensemble_kline_df[ensemble_kline_df["_ts_utc"] <= primary_bar_ts]
-
-        if len(ens_available) >= ensemble_lookback:
-            ens_context = ens_available.tail(ensemble_lookback).copy().reset_index(drop=True)
-            ens_x_ts = ens_context["timestamps"].reset_index(drop=True)
-            ens_last_ts = ens_context["timestamps"].iloc[-1]
-            ens_previous_close = float(ens_context["close"].iloc[-1])
-            ens_y_ts = compute_future_timestamps(ens_last_ts, ensemble_interval, ensemble_pred_len)
-            ens_model_df = prepare_model_frame(ens_context, backtest_config["use_volume"])
-
-            with torch.no_grad():
-                ens_path_frames = predictor.predict_paths(
-                    df=ens_model_df,
-                    x_timestamp=ens_x_ts,
-                    y_timestamp=ens_y_ts,
-                    pred_len=ensemble_pred_len,
-                    T=backtest_config["temperature"],
-                    top_k=backtest_config["top_k"],
-                    top_p=backtest_config["top_p"],
-                    sample_count=effective_sample_count,
-                    verbose=False,
-                )
-
-            ens_arrays = np.stack(
-                [f[FEATURE_NAMES].to_numpy(dtype=np.float64) for f in ens_path_frames]
-            )
-            ens_sig = compute_signal(
-                ens_arrays, ens_previous_close, ensemble_pred_len,
-                signal_scale, min_predicted_sharpe, skew_weight, confidence_threshold,
-            )
-            ensemble_signal = ens_sig["composite_signal"]
-
-        # Blend: primary * (1 - weight) + ensemble * weight
-        blended_signal = sig["composite_signal"] * (1.0 - ensemble_weight) + ensemble_signal * ensemble_weight
-        blended_signal = float(np.clip(blended_signal, -1.0, 1.0))
-
-        # Confluence check: if primary and ensemble disagree on direction, dampen
-        if np.sign(sig["composite_signal"]) != np.sign(ensemble_signal) and ensemble_signal != 0.0:
-            blended_signal *= 0.3
-
-        # Position management with continuous sizing
         prev_position = position
-        entry_event = False
-        exit_event = False
+        new_position, entry_event, exit_event = decide_next_position(
+            position, predicted_return, entry_threshold, exit_threshold,
+        )
+        position = new_position
+
         fee_paid = 0.0
-
-        desired_position = blended_signal
-        confident = sig["trajectory_confidence"] >= confidence_threshold
-
-        if position == 0.0:
-            if confident and abs(desired_position) > 0.1:
-                position = desired_position
-                bars_held = 0
-                entry_event = True
-                if apply_fees:
-                    fee_paid += entry_fee_rate
-        else:
-            bars_held += 1
-            can_exit = bars_held >= min_hold_bars
-
-            if can_exit:
-                # Position flip: sign changed and new signal is confident
-                sign_flipped = np.sign(desired_position) != np.sign(position) and np.sign(desired_position) != 0
-                conviction_gone = not confident or abs(desired_position) < 0.05
-
-                if sign_flipped and confident and abs(desired_position) > 0.1:
-                    exit_event = True
-                    entry_event = True
-                    position = desired_position
-                    bars_held = 0
-                    if apply_fees:
-                        fee_paid += exit_fee_rate + entry_fee_rate
-                elif conviction_gone:
-                    exit_event = True
-                    position = 0.0
-                    bars_held = 0
-                    if apply_fees:
-                        fee_paid += exit_fee_rate
-                else:
-                    # Update position size without paying fees (same direction)
-                    position = desired_position
+        if apply_fees:
+            if exit_event:
+                fee_paid += exit_fee_rate
+            if entry_event:
+                fee_paid += entry_fee_rate
 
         gross_strategy_return = float(prev_position * actual_return)
         net_strategy_return = float((1.0 + gross_strategy_return) * (1.0 - fee_paid) - 1.0)
 
-        # First-step predicted close (for logging)
-        mean_first_close = float(np.mean(path_arrays[:, 0, FEATURE_NAMES.index("close")]))
-
         rows.append({
             "target_timestamp": isoformat_timestamp(actual_row["timestamps"]),
             "previous_close": previous_close,
-            "predicted_close_step1": mean_first_close,
+            "predicted_close": predicted_close_mean,
             "actual_close": actual_close,
+            "predicted_return": predicted_return,
             "actual_return": actual_return,
-            "actual_trajectory_return": actual_trajectory_return,
-            "trajectory_return": sig["trajectory_return"],
-            "trajectory_up_probability": sig["trajectory_up_probability"],
-            "trajectory_confidence": sig["trajectory_confidence"],
-            "next_bar_up_probability": sig["next_bar_up_probability"],
-            "predicted_vol": sig["predicted_vol"],
-            "predicted_sharpe": sig["predicted_sharpe"],
-            "skewness": sig["skewness"],
-            "kurtosis": sig["kurtosis"],
-            "return_std": sig["return_std"],
-            "downside_tail": sig["downside_tail"],
-            "upside_tail": sig["upside_tail"],
-            "magnitude_signal": sig["magnitude_signal"],
-            "probability_signal": sig["probability_signal"],
-            "skew_bonus": sig["skew_bonus"],
-            "vol_gate": sig["vol_gate"],
-            "composite_signal": sig["composite_signal"],
-            "ensemble_signal": ensemble_signal,
-            "blended_signal": blended_signal,
+            "next_bar_up_probability": next_bar_up_probability,
             "position": prev_position,
             "new_position": position,
             "entry_event": entry_event,
             "exit_event": exit_event,
-            "bars_held": bars_held,
             "fee_paid": fee_paid,
-            "entry_fee_rate": entry_fee_rate if entry_event else 0.0,
-            "exit_fee_rate": exit_fee_rate if exit_event else 0.0,
             "gross_strategy_return": gross_strategy_return,
             "net_strategy_return": net_strategy_return,
             "forecast_mode": forecast_mode,
             "effective_sample_count": effective_sample_count,
-            "close_abs_error": float(abs(mean_first_close - actual_close)),
+            "close_abs_error": float(abs(predicted_close_mean - actual_close)),
         })
 
     results_df = pd.DataFrame(rows)
-    metrics = compute_backtest_metrics(results_df)
+    metrics = compute_backtest_metrics(results_df, interval)
 
     generated_at = datetime.now(UTC)
     run_id = f"{symbol.lower()}_{interval}_backtest_{generated_at.strftime('%Y%m%dT%H%M%SZ')}"
@@ -501,6 +311,9 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
             "evaluation_bars": evaluation_bars,
             "effective_sample_count": effective_sample_count,
             "forecast_mode": forecast_mode,
+            "round_trip_fee_rate": rt_fee,
+            "entry_threshold": entry_threshold,
+            "exit_threshold": exit_threshold,
         },
         "metrics": metrics,
         "artifacts": {
@@ -522,16 +335,18 @@ def print_summary(summary: dict) -> None:
     print(
         f"{summary['symbol']} {summary['interval']} | "
         f"days: {p['evaluation_days']} | bars: {p['evaluation_bars']} | "
-        f"pred_len: {p['pred_len']} | mode: {p['forecast_mode']}"
+        f"mode: {p['forecast_mode']}"
+    )
+    print(
+        f"entry: {p['entry_threshold']*100:.3f}% | exit: {p['exit_threshold']*100:.3f}% | "
+        f"round-trip fee: {p['round_trip_fee_rate']*100:.3f}%"
     )
     print(f"{'─'*80}")
     print(f"  Prediction quality:")
     print(
-        f"    next-bar dir accuracy: {m['next_bar_direction_accuracy']:.1%} | "
-        f"trajectory dir accuracy: {m['trajectory_direction_accuracy']:.1%}"
-    )
-    print(
-        f"    trajectory correlation: {m['return_correlation'] if m['return_correlation'] is not None else 'n/a'}"
+        f"    direction accuracy: {m['direction_accuracy']:.1%} | "
+        f"return MAE: {m['return_mae']:.6f} | "
+        f"correlation: {m['return_correlation'] if m['return_correlation'] is not None else 'n/a'}"
     )
     print(f"{'─'*80}")
     print(f"  Strategy performance:")
@@ -551,7 +366,7 @@ def print_summary(summary: dict) -> None:
         f"    bars in position: {m['bars_in_position']}/{m['num_periods']} | "
         f"bars flat: {m['bars_flat']}/{m['num_periods']}"
     )
-    print(f"    avg position size: {m['average_position_size']:.3f} | total fees: {m['total_fees_paid']:.6f}")
+    print(f"    total fees: {m['total_fees_paid']:.6f}")
     print(f"{'='*80}\n")
 
 

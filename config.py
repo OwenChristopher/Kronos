@@ -50,32 +50,22 @@ class Config:
 
     backtest = {
         "symbol": "BTCUSDT",
-        "interval": "1d",
+        "interval": "4h",
         "lookback": 180,
-        "evaluation_days": 60,
-        "pred_len": 6,
+        "evaluation_days": 30,
         "use_monte_carlo_average": True,
         "monte_carlo_paths": 100,
-        "temperature": 0.6,
+        "temperature": 1.0,
         "top_k": 0,
-        "top_p": 0.90,
+        "top_p": 0.95,
         "use_volume": True,
         "apply_fees": True,
         "entry_fee_rate": 0.0004,
         "exit_fee_rate": 0.0003,
-        # Position-holding strategy params
-        "confidence_threshold": 0.60,
-        "min_hold_bars": 3,
-        # Continuous sizing params (strategy K)
-        "signal_scale": 0.01,
-        # Volatility-adjusted signal (strategy F)
-        "min_predicted_sharpe": 0.5,
-        # MC distribution shape (strategy G)
-        "skew_weight": 0.3,
-        # Timeframe ensemble (strategy L)
-        # Secondary interval run at each primary bar for confluence
-        "ensemble_interval": "1h",
-        "ensemble_lookback": 240,
-        "ensemble_pred_len": 12,
-        "ensemble_weight": 0.0, #set to some amount like 0.4 default to enable ensemble
+        # Fee-aware threshold (multipliers applied to round-trip fee):
+        #   enter only when |predicted_return| > entry_threshold_multiplier * rt_fee
+        #   stay in position while opposite signal < exit_threshold_multiplier * rt_fee
+        # Round-trip fee at default rates = 0.07% -> entry ~0.14%, exit ~0.035%.
+        "entry_threshold_multiplier": 2.0,
+        "exit_threshold_multiplier": 0.5,
     }
