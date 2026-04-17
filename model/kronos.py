@@ -386,7 +386,7 @@ def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None, sample_l
     return x
 
 
-def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False):
+def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False, return_paths=False):
     with torch.no_grad():
         x = torch.clip(x, -clip, clip)
 
@@ -464,6 +464,8 @@ def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context
         z = tokenizer.decode(input_tokens, half=True)
         z = z.reshape(-1, sample_count, z.size(1), z.size(2))
         preds = z.cpu().numpy()
+        if return_paths:
+            return preds
         preds = np.mean(preds, axis=1)
 
         return preds
@@ -505,18 +507,21 @@ class KronosPredictor:
         self.tokenizer = self.tokenizer.to(self.device)
         self.model = self.model.to(self.device)
 
-    def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose):
+    def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose, return_paths=False):
 
         x_tensor = torch.from_numpy(np.array(x).astype(np.float32)).to(self.device)
         x_stamp_tensor = torch.from_numpy(np.array(x_stamp).astype(np.float32)).to(self.device)
         y_stamp_tensor = torch.from_numpy(np.array(y_stamp).astype(np.float32)).to(self.device)
 
         preds = auto_regressive_inference(self.tokenizer, self.model, x_tensor, x_stamp_tensor, y_stamp_tensor, self.max_context, pred_len,
-                                          self.clip, T, top_k, top_p, sample_count, verbose)
-        preds = preds[:, -pred_len:, :]
+                                          self.clip, T, top_k, top_p, sample_count, verbose, return_paths=return_paths)
+        if return_paths:
+            preds = preds[:, :, -pred_len:, :]
+        else:
+            preds = preds[:, -pred_len:, :]
         return preds
 
-    def predict(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):
+    def _prepare_prediction_inputs(self, df, x_timestamp, y_timestamp):
 
         if not isinstance(df, pd.DataFrame):
             raise ValueError("Input must be a pandas DataFrame.")
@@ -526,8 +531,8 @@ class KronosPredictor:
 
         df = df.copy()
         if self.vol_col not in df.columns:
-            df[self.vol_col] = 0.0  # Fill missing volume with zeros
-            df[self.amt_vol] = 0.0  # Fill missing amount with zeros
+            df[self.vol_col] = 0.0
+            df[self.amt_vol] = 0.0
         if self.amt_vol not in df.columns and self.vol_col in df.columns:
             df[self.amt_vol] = df[self.vol_col] * df[self.price_cols].mean(axis=1)
 
@@ -549,6 +554,11 @@ class KronosPredictor:
         x = x[np.newaxis, :]
         x_stamp = x_stamp[np.newaxis, :]
         y_stamp = y_stamp[np.newaxis, :]
+        return x, x_stamp, y_stamp, x_mean, x_std
+
+    def predict(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):
+
+        x, x_stamp, y_stamp, x_mean, x_std = self._prepare_prediction_inputs(df, x_timestamp, y_timestamp)
 
         preds = self.generate(x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose)
 
@@ -557,6 +567,32 @@ class KronosPredictor:
 
         pred_df = pd.DataFrame(preds, columns=self.price_cols + [self.vol_col, self.amt_vol], index=y_timestamp)
         return pred_df
+
+    def predict_paths(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):
+
+        if sample_count < 1:
+            raise ValueError("sample_count must be at least 1.")
+
+        x, x_stamp, y_stamp, x_mean, x_std = self._prepare_prediction_inputs(df, x_timestamp, y_timestamp)
+
+        preds = self.generate(
+            x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose,
+            return_paths=True,
+        )
+
+        preds = preds.squeeze(0)
+        preds = preds * (x_std + 1e-5) + x_mean
+
+        pred_paths = []
+        for sample_idx in range(preds.shape[0]):
+            pred_paths.append(
+                pd.DataFrame(
+                    preds[sample_idx],
+                    columns=self.price_cols + [self.vol_col, self.amt_vol],
+                    index=y_timestamp,
+                )
+            )
+        return pred_paths
 
 
     def predict_batch(self, df_list, x_timestamp_list, y_timestamp_list, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):

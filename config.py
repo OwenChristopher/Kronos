@@ -50,10 +50,10 @@ class Config:
 
     backtest = {
         "symbol": "BTCUSDT",
-        "interval": "4h",
+        "interval": "1d",
         "lookback": 180,
         "evaluation_days": 60,
-        "pred_len": 1,
+        "pred_len": 6,
         "use_monte_carlo_average": True,
         "monte_carlo_paths": 100,
         "temperature": 0.6,
@@ -63,9 +63,19 @@ class Config:
         "apply_fees": True,
         "entry_fee_rate": 0.0004,
         "exit_fee_rate": 0.0003,
-        # Position-holding strategy: only enter on high conviction, hold through noise
-        "entry_threshold": 0.003,       # predicted |return| must exceed 0.3% to enter
-        "exit_threshold": 0.001,        # close position when conviction drops below 0.1%
-        "confidence_threshold": 0.60,   # MC path agreement required to enter (0.5 = no filter)
-        "min_hold_bars": 3,             # hold at least 3 bars (12h for 4h candles) before allowing exit
+        # Position-holding strategy params
+        "confidence_threshold": 0.60,
+        "min_hold_bars": 3,
+        # Continuous sizing params (strategy K)
+        "signal_scale": 0.01,
+        # Volatility-adjusted signal (strategy F)
+        "min_predicted_sharpe": 0.5,
+        # MC distribution shape (strategy G)
+        "skew_weight": 0.3,
+        # Timeframe ensemble (strategy L)
+        # Secondary interval run at each primary bar for confluence
+        "ensemble_interval": "1h",
+        "ensemble_lookback": 240,
+        "ensemble_pred_len": 12,
+        "ensemble_weight": 0.0, #set to some amount like 0.4 default to enable ensemble
     }

@@ -49,6 +49,7 @@ Desktop.ini
 *.parquet
 *.h5
 *.hdf5
+forecast_cache/
 
 # Model files (large files)
 *.pth
