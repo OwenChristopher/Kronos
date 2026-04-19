@@ -52,6 +52,8 @@ class Config:
         "symbol": "BTCUSDT",
         "interval": "4h",
         "lookback": 180,
+        # 6 * 4h = 24h horizon, which matches the demo's BTC direction framing.
+        "pred_len": 6,
         "evaluation_days": 30,
         "use_monte_carlo_average": True,
         "monte_carlo_paths": 100,
@@ -62,7 +64,8 @@ class Config:
         "apply_fees": True,
         "entry_fee_rate": 0.0004,
         "exit_fee_rate": 0.0003,
-        # Fee-aware threshold (multipliers applied to round-trip fee):
+        # Fee-aware threshold (multipliers applied to round-trip fee) applied to
+        # the horizon-end predicted return used for the trading signal.
         #   enter only when |predicted_return| > entry_threshold_multiplier * rt_fee
         #   stay in position while opposite signal < exit_threshold_multiplier * rt_fee
         # Round-trip fee at default rates = 0.07% -> entry ~0.14%, exit ~0.035%.

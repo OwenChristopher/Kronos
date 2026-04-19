@@ -26,7 +26,7 @@ CLOSE_INDEX = FEATURE_NAMES.index("close")
 def get_backtest_config() -> dict:
     config = dict(Config.backtest)
     required_keys = {
-        "symbol", "interval", "lookback", "evaluation_days",
+        "symbol", "interval", "lookback", "pred_len", "evaluation_days",
         "use_monte_carlo_average", "monte_carlo_paths",
         "temperature", "top_k", "top_p", "use_volume",
         "apply_fees", "entry_fee_rate", "exit_fee_rate",
@@ -37,6 +37,8 @@ def get_backtest_config() -> dict:
         raise KeyError(f"Missing backtest config keys in config.py: {missing}")
     if config["monte_carlo_paths"] < 1:
         raise ValueError("monte_carlo_paths must be at least 1.")
+    if int(config["pred_len"]) < 1:
+        raise ValueError("pred_len must be at least 1.")
     if float(config["evaluation_days"]) <= 0:
         raise ValueError("evaluation_days must be greater than 0.")
     return config
@@ -102,26 +104,58 @@ def decide_next_position(
 # Metrics
 # ---------------------------------------------------------------------------
 
-def compute_backtest_metrics(results_df: pd.DataFrame, interval: str) -> dict:
-    predicted_returns = results_df["predicted_return"].to_numpy(dtype=np.float64)
-    actual_returns = results_df["actual_return"].to_numpy(dtype=np.float64)
+def compute_backtest_metrics(
+    results_df: pd.DataFrame,
+    interval: str,
+    apply_fees: bool,
+    entry_fee: float,
+    exit_fee: float,
+) -> dict:
+    predicted_returns_step1 = results_df["predicted_return_step1"].to_numpy(dtype=np.float64)
+    actual_returns_step1 = results_df["actual_return_step1"].to_numpy(dtype=np.float64)
+    predicted_returns_horizon = results_df["predicted_return_horizon"].to_numpy(dtype=np.float64)
+    actual_returns_horizon = results_df["actual_return_horizon"].to_numpy(dtype=np.float64)
     gross_strategy_returns = results_df["gross_strategy_return"].to_numpy(dtype=np.float64)
     net_strategy_returns = results_df["net_strategy_return"].to_numpy(dtype=np.float64)
 
-    mae = float(np.mean(np.abs(predicted_returns - actual_returns)))
-    direction_accuracy = float(np.mean(np.sign(predicted_returns) == np.sign(actual_returns)))
+    next_bar_return_mae = float(np.mean(np.abs(predicted_returns_step1 - actual_returns_step1)))
+    horizon_return_mae = float(np.mean(np.abs(predicted_returns_horizon - actual_returns_horizon)))
+    next_bar_direction_accuracy = float(
+        np.mean(np.sign(predicted_returns_step1) == np.sign(actual_returns_step1))
+    )
+    horizon_end_direction_accuracy = float(
+        np.mean((results_df["horizon_end_up_probability"].to_numpy(dtype=np.float64) >= 0.5) ==
+                (actual_returns_horizon >= 0.0))
+    )
+    horizon_end_mean_direction_accuracy = float(
+        np.mean(np.sign(predicted_returns_horizon) == np.sign(actual_returns_horizon))
+    )
 
-    correlation = None
-    if len(results_df) > 1 and np.std(predicted_returns) > 0 and np.std(actual_returns) > 0:
-        correlation = float(np.corrcoef(predicted_returns, actual_returns)[0, 1])
+    next_bar_return_correlation = None
+    if (
+        len(results_df) > 1
+        and np.std(predicted_returns_step1) > 0
+        and np.std(actual_returns_step1) > 0
+    ):
+        next_bar_return_correlation = float(
+            np.corrcoef(predicted_returns_step1, actual_returns_step1)[0, 1]
+        )
+
+    horizon_return_correlation = None
+    if (
+        len(results_df) > 1
+        and np.std(predicted_returns_horizon) > 0
+        and np.std(actual_returns_horizon) > 0
+    ):
+        horizon_return_correlation = float(
+            np.corrcoef(predicted_returns_horizon, actual_returns_horizon)[0, 1]
+        )
 
     cumulative_strategy_return_gross = float(np.prod(1.0 + gross_strategy_returns) - 1.0)
     cumulative_strategy_return_net = float(np.prod(1.0 + net_strategy_returns) - 1.0)
-    cumulative_buy_hold_return_gross = float(np.prod(1.0 + actual_returns) - 1.0)
+    cumulative_buy_hold_return_gross = float(np.prod(1.0 + actual_returns_step1) - 1.0)
 
-    entry_fee = float(Config.backtest["entry_fee_rate"])
-    exit_fee = float(Config.backtest["exit_fee_rate"])
-    buy_hold_fee_multiplier = (1.0 - entry_fee) * (1.0 - exit_fee)
+    buy_hold_fee_multiplier = (1.0 - entry_fee) * (1.0 - exit_fee) if apply_fees else 1.0
     cumulative_buy_hold_return_net = float(
         (1.0 + cumulative_buy_hold_return_gross) * buy_hold_fee_multiplier - 1.0
     )
@@ -146,9 +180,16 @@ def compute_backtest_metrics(results_df: pd.DataFrame, interval: str) -> dict:
 
     return {
         "num_periods": int(len(results_df)),
-        "direction_accuracy": direction_accuracy,
-        "return_mae": mae,
-        "return_correlation": correlation,
+        "direction_accuracy": horizon_end_direction_accuracy,
+        "next_bar_direction_accuracy": next_bar_direction_accuracy,
+        "horizon_end_direction_accuracy": horizon_end_direction_accuracy,
+        "horizon_end_mean_direction_accuracy": horizon_end_mean_direction_accuracy,
+        "next_bar_return_mae": next_bar_return_mae,
+        "horizon_return_mae": horizon_return_mae,
+        "return_mae": horizon_return_mae,
+        "next_bar_return_correlation": next_bar_return_correlation,
+        "horizon_return_correlation": horizon_return_correlation,
+        "return_correlation": horizon_return_correlation,
         "cumulative_strategy_return_gross": cumulative_strategy_return_gross,
         "cumulative_strategy_return_net": cumulative_strategy_return_net,
         "cumulative_buy_hold_return_gross": cumulative_buy_hold_return_gross,
@@ -180,6 +221,7 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
         else 1
     )
     evaluation_bars = compute_evaluation_bars(interval, backtest_config["evaluation_days"])
+    pred_len = int(backtest_config["pred_len"])
     forecast_mode = (
         f"monte_carlo_average_{backtest_config['monte_carlo_paths']}"
         if backtest_config["use_monte_carlo_average"]
@@ -199,9 +241,9 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
 
     kline_df, cache_path = update_kline_cache(
         Config.cache_root, symbol, interval, Config.binance_limit,
-        min_rows=backtest_config["lookback"] + evaluation_bars,
+        min_rows=backtest_config["lookback"] + evaluation_bars + pred_len - 1,
     )
-    minimum_rows = backtest_config["lookback"] + evaluation_bars
+    minimum_rows = backtest_config["lookback"] + evaluation_bars + pred_len - 1
     if len(kline_df) < minimum_rows:
         raise RuntimeError(
             f"Need at least {minimum_rows} closed {interval} candles, got {len(kline_df)}."
@@ -209,26 +251,31 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
 
     print(
         f"Loaded {len(kline_df)} {interval} bars | "
+        f"forecast horizon: {pred_len} bars | "
         f"entry threshold: {entry_threshold*100:.3f}% | exit threshold: {exit_threshold*100:.3f}% | "
         f"round-trip fee: {rt_fee*100:.3f}%"
     )
 
-    evaluation_start = len(kline_df) - evaluation_bars
+    evaluation_stop = len(kline_df) - pred_len + 1
+    evaluation_start = evaluation_stop - evaluation_bars
     rows = []
 
     position = 0.0
 
-    for target_idx in tqdm(range(evaluation_start, len(kline_df)), desc="Backtesting", unit="bar"):
+    for target_idx in tqdm(range(evaluation_start, evaluation_stop), desc="Backtesting", unit="bar"):
         context_start = target_idx - backtest_config["lookback"]
         context_df = kline_df.iloc[context_start:target_idx].copy().reset_index(drop=True)
-        actual_row = kline_df.iloc[target_idx]
+        actual_row_step1 = kline_df.iloc[target_idx]
+        actual_row_horizon = kline_df.iloc[target_idx + pred_len - 1]
         previous_close = float(context_df["close"].iloc[-1])
-        actual_close = float(actual_row["close"])
-        actual_return = float((actual_close / previous_close) - 1.0)
+        actual_close_step1 = float(actual_row_step1["close"])
+        actual_close_horizon = float(actual_row_horizon["close"])
+        actual_return_step1 = float((actual_close_step1 / previous_close) - 1.0)
+        actual_return_horizon = float((actual_close_horizon / previous_close) - 1.0)
 
         x_timestamp = context_df["timestamps"].reset_index(drop=True)
         last_ts = context_df["timestamps"].iloc[-1]
-        y_timestamp = compute_future_timestamps(last_ts, interval, 1)
+        y_timestamp = compute_future_timestamps(last_ts, interval, pred_len)
 
         model_df = prepare_model_frame(context_df, backtest_config["use_volume"])
 
@@ -237,7 +284,7 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
                 df=model_df,
                 x_timestamp=x_timestamp,
                 y_timestamp=y_timestamp,
-                pred_len=1,
+                pred_len=pred_len,
                 T=backtest_config["temperature"],
                 top_k=backtest_config["top_k"],
                 top_p=backtest_config["top_p"],
@@ -245,17 +292,21 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
                 verbose=False,
             )
 
-        path_closes = np.array(
-            [float(frame[FEATURE_NAMES].to_numpy(dtype=np.float64)[0, CLOSE_INDEX])
-             for frame in path_frames]
+        path_closes = np.stack(
+            [frame["close"].to_numpy(dtype=np.float64) for frame in path_frames]
         )
-        predicted_close_mean = float(np.mean(path_closes))
-        predicted_return = float((predicted_close_mean / previous_close) - 1.0)
-        next_bar_up_probability = float(np.mean(path_closes > previous_close))
+        path_closes_step1 = path_closes[:, 0]
+        path_closes_horizon = path_closes[:, -1]
+        predicted_close_step1 = float(np.mean(path_closes_step1))
+        predicted_close_horizon = float(np.mean(path_closes_horizon))
+        predicted_return_step1 = float((predicted_close_step1 / previous_close) - 1.0)
+        predicted_return_horizon = float((predicted_close_horizon / previous_close) - 1.0)
+        next_bar_up_probability = float(np.mean(path_closes_step1 > previous_close))
+        horizon_end_up_probability = float(np.mean(path_closes_horizon > previous_close))
 
         prev_position = position
         new_position, entry_event, exit_event = decide_next_position(
-            position, predicted_return, entry_threshold, exit_threshold,
+            position, predicted_return_horizon, entry_threshold, exit_threshold,
         )
         position = new_position
 
@@ -266,18 +317,28 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
             if entry_event:
                 fee_paid += entry_fee_rate
 
-        gross_strategy_return = float(prev_position * actual_return)
+        # The forecast is formed before the target bar opens, so the chosen
+        # position is the exposure for that bar's realized return.
+        gross_strategy_return = float(position * actual_return_step1)
         net_strategy_return = float((1.0 + gross_strategy_return) * (1.0 - fee_paid) - 1.0)
 
         rows.append({
-            "target_timestamp": isoformat_timestamp(actual_row["timestamps"]),
+            "target_timestamp": isoformat_timestamp(actual_row_step1["timestamps"]),
+            "horizon_end_timestamp": isoformat_timestamp(actual_row_horizon["timestamps"]),
             "previous_close": previous_close,
-            "predicted_close": predicted_close_mean,
-            "actual_close": actual_close,
-            "predicted_return": predicted_return,
-            "actual_return": actual_return,
+            "predicted_close_step1": predicted_close_step1,
+            "predicted_close_horizon": predicted_close_horizon,
+            "actual_close_step1": actual_close_step1,
+            "actual_close_horizon": actual_close_horizon,
+            "predicted_return_step1": predicted_return_step1,
+            "predicted_return_horizon": predicted_return_horizon,
+            "actual_return_step1": actual_return_step1,
+            "actual_return_horizon": actual_return_horizon,
+            "signal_return": predicted_return_horizon,
             "next_bar_up_probability": next_bar_up_probability,
-            "position": prev_position,
+            "horizon_end_up_probability": horizon_end_up_probability,
+            "previous_position": prev_position,
+            "position": position,
             "new_position": position,
             "entry_event": entry_event,
             "exit_event": exit_event,
@@ -286,11 +347,18 @@ def run_backtest() -> tuple[dict, pd.DataFrame, Path]:
             "net_strategy_return": net_strategy_return,
             "forecast_mode": forecast_mode,
             "effective_sample_count": effective_sample_count,
-            "close_abs_error": float(abs(predicted_close_mean - actual_close)),
+            "close_abs_error_step1": float(abs(predicted_close_step1 - actual_close_step1)),
+            "close_abs_error_horizon": float(abs(predicted_close_horizon - actual_close_horizon)),
         })
 
     results_df = pd.DataFrame(rows)
-    metrics = compute_backtest_metrics(results_df, interval)
+    metrics = compute_backtest_metrics(
+        results_df,
+        interval,
+        apply_fees=apply_fees,
+        entry_fee=entry_fee_rate,
+        exit_fee=exit_fee_rate,
+    )
 
     generated_at = datetime.now(UTC)
     run_id = f"{symbol.lower()}_{interval}_backtest_{generated_at.strftime('%Y%m%dT%H%M%SZ')}"
@@ -335,7 +403,7 @@ def print_summary(summary: dict) -> None:
     print(
         f"{summary['symbol']} {summary['interval']} | "
         f"days: {p['evaluation_days']} | bars: {p['evaluation_bars']} | "
-        f"mode: {p['forecast_mode']}"
+        f"horizon: {p['pred_len']} bars | mode: {p['forecast_mode']}"
     )
     print(
         f"entry: {p['entry_threshold']*100:.3f}% | exit: {p['exit_threshold']*100:.3f}% | "
@@ -344,9 +412,19 @@ def print_summary(summary: dict) -> None:
     print(f"{'─'*80}")
     print(f"  Prediction quality:")
     print(
-        f"    direction accuracy: {m['direction_accuracy']:.1%} | "
-        f"return MAE: {m['return_mae']:.6f} | "
-        f"correlation: {m['return_correlation'] if m['return_correlation'] is not None else 'n/a'}"
+        f"    horizon-end direction accuracy: {m['horizon_end_direction_accuracy']:.1%} | "
+        f"mean-sign accuracy: {m['horizon_end_mean_direction_accuracy']:.1%} | "
+        f"next-bar direction accuracy: {m['next_bar_direction_accuracy']:.1%}"
+    )
+    print(
+        f"    horizon return MAE: {m['horizon_return_mae']:.6f} | "
+        f"next-bar return MAE: {m['next_bar_return_mae']:.6f}"
+    )
+    print(
+        f"    horizon correlation: "
+        f"{m['horizon_return_correlation'] if m['horizon_return_correlation'] is not None else 'n/a'} | "
+        f"next-bar correlation: "
+        f"{m['next_bar_return_correlation'] if m['next_bar_return_correlation'] is not None else 'n/a'}"
     )
     print(f"{'─'*80}")
     print(f"  Strategy performance:")

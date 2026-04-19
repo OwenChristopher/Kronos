@@ -76,3 +76,4 @@ venv.bak/
 temp/
 tmp/
 .python-version
+.codex
